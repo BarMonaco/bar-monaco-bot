@@ -5,16 +5,47 @@ app.use(express.json());
 
 // ── CONFIGURACIÓN ──────────────────────────────────────────
 const CONFIG = {
-  // WhatsApp
-  WA_TOKEN:       process.env.WA_TOKEN,
-  WA_PHONE_ID:    process.env.WA_PHONE_ID,
-  VERIFY_TOKEN:   process.env.VERIFY_TOKEN,
-
-  // Spotify
+  WA_TOKEN:         process.env.WA_TOKEN,
+  WA_PHONE_ID:      process.env.WA_PHONE_ID,
+  VERIFY_TOKEN:     process.env.VERIFY_TOKEN,
   SP_CLIENT_ID:     process.env.SP_CLIENT_ID,
   SP_CLIENT_SECRET: process.env.SP_CLIENT_SECRET,
   SP_REFRESH_TOKEN: process.env.SP_REFRESH_TOKEN,
 };
+
+// ── RATE LIMITING ──────────────────────────────────────────
+// Máximo 3 canciones cada 15 minutos por número
+const LIMITE_CANCIONES = 3;
+const VENTANA_MINUTOS  = 15;
+const VENTANA_MS       = VENTANA_MINUTOS * 60 * 1000;
+
+// Mapa: número -> [ timestamp1, timestamp2, ... ]
+const solicitudes = new Map();
+
+function puedesPedir(numero) {
+  const ahora = Date.now();
+  const tiempos = solicitudes.get(numero) || [];
+
+  // Filtra solo los que están dentro de la ventana de 15 min
+  const recientes = tiempos.filter(t => ahora - t < VENTANA_MS);
+  solicitudes.set(numero, recientes);
+
+  if (recientes.length >= LIMITE_CANCIONES) {
+    // Calcula cuánto tiempo falta para poder pedir de nuevo
+    const masAntiguo = recientes[0];
+    const faltaMs    = VENTANA_MS - (ahora - masAntiguo);
+    const faltaMin   = Math.ceil(faltaMs / 60000);
+    return { permitido: false, faltaMin };
+  }
+
+  return { permitido: true };
+}
+
+function registrarSolicitud(numero) {
+  const tiempos = solicitudes.get(numero) || [];
+  tiempos.push(Date.now());
+  solicitudes.set(numero, tiempos);
+}
 
 // ── SPOTIFY: obtener access token ──────────────────────────
 async function getSpotifyToken() {
@@ -97,7 +128,7 @@ app.get("/webhook", (req, res) => {
 
 // ── WEBHOOK: recibir mensajes ──────────────────────────────
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // Responder rápido a Meta
+  res.sendStatus(200);
 
   try {
     const entry   = req.body.entry?.[0];
@@ -112,39 +143,67 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`📩 Mensaje de ${from}: "${text}"`);
 
-    // Buscar en Spotify
+    // ── Verificar que no pida más de una canción por mensaje ──
+    // Si el mensaje tiene más de 60 caracteres o contiene saltos de línea/comas/&/y
+    const tieneSalto    = /[\n\r]/.test(text);
+    const tieneConector = /\b(y|and|&|\+)\b/i.test(text);
+    const muyLargo      = text.length > 60;
+
+    if (tieneSalto || (tieneConector && muyLargo)) {
+      await sendMessage(
+        from,
+        `Por favor pide una sola canción por mensaje 🎵\n\n🏁🏁 Bar Mónaco 🏁🏁`
+      );
+      return;
+    }
+
+    // ── Verificar límite de canciones ──
+    const { permitido, faltaMin } = puedesPedir(from);
+
+    if (!permitido) {
+      await sendMessage(
+        from,
+        `⛔ Ya pediste ${LIMITE_CANCIONES} canciones en los últimos ${VENTANA_MINUTOS} minutos.\n\n⏱️ Puedes pedir de nuevo en ${faltaMin} minuto${faltaMin > 1 ? "s" : ""}.\n\n🏁🏁 Bar Mónaco 🏁🏁`
+      );
+      return;
+    }
+
+    // ── Buscar en Spotify ──
     const spToken = await getSpotifyToken();
     const song    = await searchSong(text, spToken);
 
     if (!song) {
       await sendMessage(
         from,
-        `❌ No encontré "${text}" en Spotify. Intenta con el nombre exacto de la canción o el artista. 🎵`
+        `❌ No encontré "${text}" en Spotify. Intenta con el nombre exacto de la canción o el artista. 🎵\n\n🏁🏁 Bar Mónaco 🏁🏁`
       );
       return;
     }
 
-    // Agregar a la cola
+    // ── Agregar a la cola y registrar solicitud ──
     await addToQueue(song.uri, spToken);
+    registrarSolicitud(from);
 
-    // Confirmar al cliente
+    // ── Responder al cliente ──
+    const recientes = (solicitudes.get(from) || []).length;
+    const restantes = LIMITE_CANCIONES - recientes;
+
     await sendMessage(
       from,
-      `✅ ¡Listo! *${song.name}* de *${song.artist}* ya está en la cola, pronto la escucharás 🎶\n🏁🏁 Bar Mónaco 🏁🏁`
+      `✅ ¡Listo! *${song.name}* de *${song.artist}* ya está en la cola, pronto la escucharás 🎶\n\nPuedes pedir ${restantes} canción${restantes !== 1 ? "es" : ""} más en los próximos ${VENTANA_MINUTOS} minutos.\n\n🏁🏁 Bar Mónaco 🏁🏁`
     );
 
-    console.log(`🎵 Agregada: ${song.name} - ${song.artist}`);
+    console.log(`🎵 Agregada: ${song.name} - ${song.artist} | Restantes para ${from}: ${restantes}`);
 
   } catch (err) {
     console.error("❌ Error:", err.response?.data || err.message);
 
-    // Si Spotify no está reproduciendo nada
     if (err.response?.status === 404 || err.response?.status === 403) {
       const from = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
       if (from) {
         await sendMessage(
           from,
-          `⚠️ En este momento Spotify no está activo en el bar. Intenta en unos minutos. 🎵\n🏁🏁 Bar Mónaco 🏁🏁`
+          `⚠️ En este momento Spotify no está activo en el bar. Intenta en unos minutos. 🎵\n\n🏁🏁 Bar Mónaco 🏁🏁`
         );
       }
     }
@@ -154,5 +213,5 @@ app.post("/webhook", async (req, res) => {
 // ── INICIAR SERVIDOR ───────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Bar Mónaco Bot corriendo en puerto ${PORT}`);
+  console.log(`🚀 Bar Mónaco Bot v2 corriendo en puerto ${PORT}`);
 });
